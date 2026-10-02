@@ -1301,7 +1301,13 @@ class InventoryOverview:
             filter_frame, text=_("gui", "inventory", "filter", "refresh"), command=self.refresh
         ).grid(column=(icolumn := icolumn + 1), row=0)
         # Inventory view
-        self._canvas = tk.Canvas(master, scrollregion=(0, 0, 0, 0))
+        self._canvas = tk.Canvas(
+            master,
+            scrollregion=(0, 0, 0, 0),
+            # Keep wheel scrolling to a small, predictable distance. Without an
+            # increment Tk can repaint a very large embedded-widget area per event.
+            yscrollincrement=32,
+        )
         self._canvas.grid(column=0, row=1, sticky="nsew")
         master.rowconfigure(1, weight=1)
         master.columnconfigure(0, weight=1)
@@ -1318,13 +1324,19 @@ class InventoryOverview:
         self._canvas.bind("<Leave>", lambda e: self._canvas.unbind_all("<MouseWheel>"))
         self._canvas.create_window(0, 0, anchor="nw", window=self._main_frame)
         self._campaigns: dict[DropsCampaign, CampaignDisplay] = {}
+        self._campaign_visibility: dict[DropsCampaign, bool] = {}
+        self._campaign_status: dict[DropsCampaign, tuple[str, str]] = {}
         self._drops: dict[str, ttk.Label] = {}
+        self._canvas_update_after: str | None = None
+        self._wheel_after: str | None = None
+        self._wheel_delta: int = 0
+        self._wheel_horizontal: bool = False
 
     def configure_theme(self, *, bg: str):
         # Canvas background needs manual control
         self._canvas.configure(bg=bg)
 
-    def _update_visibility(self, campaign: DropsCampaign):
+    def _update_visibility(self, campaign: DropsCampaign) -> bool:
         # True if the campaign is supposed to show, False makes it hidden.
         frame = self._campaigns[campaign]["frame"]
         not_linked = bool(self._filters["not_linked"].get())
@@ -1333,7 +1345,7 @@ class InventoryOverview:
         upcoming = bool(self._filters["upcoming"].get())
         finished = bool(self._filters["finished"].get())
         priority_only = self._settings.priority_mode is PriorityMode.PRIORITY_ONLY
-        if (
+        visible = (
             campaign.required_minutes > 0  # don't show sub-only campaigns
             and (not_linked or campaign.eligible)
             and (campaign.active or upcoming and campaign.upcoming or expired and campaign.expired)
@@ -1344,10 +1356,15 @@ class InventoryOverview:
                 )
             )
             and (finished or not campaign.finished)
-        ):
+        )
+        if self._campaign_visibility.get(campaign) == visible:
+            return False
+        self._campaign_visibility[campaign] = visible
+        if visible:
             frame.grid()
         else:
             frame.grid_remove()
+        return True
 
     def _on_tab_switched(self, event: tk.Event[ttk.Notebook]) -> None:
         if self._manager.tabs.current_tab() == 1:
@@ -1368,26 +1385,51 @@ class InventoryOverview:
 
     def refresh(self):
         for campaign in self._campaigns:
-            # status
+            # Avoid forcing Tk to restyle/re-layout every campaign on every tab
+            # switch when the status and visibility are unchanged.
             status_label = self._campaigns[campaign]["status"]
-            status_text, status_color = self.get_status(campaign)
-            status_label.config(text=status_text, foreground=status_color)
-            # visibility
+            status = self.get_status(campaign)
+            if self._campaign_status.get(campaign) != status:
+                self._campaign_status[campaign] = status
+                status_label.config(text=status[0], foreground=status[1])
             self._update_visibility(campaign)
         self._canvas_update()
 
     def _canvas_update(self, event: tk.Event[tk.Canvas] | None = None):
-        self._canvas.update_idletasks()
-        self._canvas.configure(scrollregion=self._canvas.bbox("all"))
+        # update_idletasks() here used to synchronously flush geometry for every
+        # campaign/drop widget. Coalesce callers and let Tk finish pending geometry
+        # naturally before calculating the scroll region.
+        if self._canvas_update_after is None:
+            self._canvas_update_after = self._canvas.after_idle(self._apply_canvas_update)
+
+    def _apply_canvas_update(self) -> None:
+        self._canvas_update_after = None
+        bbox = self._canvas.bbox("all")
+        self._canvas.configure(scrollregion=bbox or (0, 0, 0, 0))
 
     def _on_mousewheel(self, event: tk.Event[tk.Misc]):
-        delta = -1 if event.delta > 0 else 1
+        # High-resolution wheels can deliver many events per frame. Applying every
+        # event individually makes a Canvas containing hundreds of Tk widgets repaint
+        # repeatedly. Accumulate them into one scroll operation per short interval.
+        self._wheel_delta += -1 if event.delta > 0 else 1
         state: int = event.state if isinstance(event.state, int) else 0
-        if state & 1:
-            scroll = self._canvas.xview_scroll
+        self._wheel_horizontal = bool(state & 1)
+        if self._wheel_after is None:
+            self._wheel_after = self._canvas.after(12, self._flush_mousewheel)
+
+    def _flush_mousewheel(self) -> None:
+        self._wheel_after = None
+        delta = self._wheel_delta
+        self._wheel_delta = 0
+        if delta == 0:
+            return
+        # Avoid a single burst jumping an excessive distance while still collapsing
+        # the dozens of duplicate wheel callbacks some Windows mice generate.
+        delta = max(-8, min(8, delta))
+        if self._wheel_horizontal:
+            self._canvas.xview_scroll(delta, "units")
         else:
-            scroll = self._canvas.yview_scroll
-        scroll(delta, "units")
+            self._canvas.yview_scroll(delta, "units")
 
     async def add_campaign(self, campaign: DropsCampaign) -> None:
         campaign_frame = ttk.Frame(self._main_frame, relief="ridge", borderwidth=1, padding=4)
@@ -1412,6 +1454,12 @@ class InventoryOverview:
             "frame": campaign_frame,
             "status": status_label,
         }
+        self._campaign_status[campaign] = (status_text, status_color)
+        # The frame starts gridded. Record that initial state, then immediately
+        # remove campaigns excluded by the current filters so Tk never lays out
+        # all hidden cards while the inventory is being populated.
+        self._campaign_visibility[campaign] = True
+        self._update_visibility(campaign)
         # Starts / Ends
         MouseOverLabel(
             campaign_frame,
@@ -1491,13 +1539,23 @@ class InventoryOverview:
             label.grid(column=0, row=1)
         if self._manager.tabs.current_tab() == 1:
             self._update_visibility(campaign)
-            self._canvas_update()
+        self._canvas_update()
 
     def clear(self) -> None:
+        if self._canvas_update_after is not None:
+            self._canvas.after_cancel(self._canvas_update_after)
+            self._canvas_update_after = None
+        if self._wheel_after is not None:
+            self._canvas.after_cancel(self._wheel_after)
+            self._wheel_after = None
+        self._wheel_delta = 0
         for child in self._main_frame.winfo_children():
             child.destroy()
         self._drops.clear()
         self._campaigns.clear()
+        self._campaign_visibility.clear()
+        self._campaign_status.clear()
+        self._canvas.configure(scrollregion=(0, 0, 0, 0))
 
     def update_progress(self, drop: TimedDrop, label: ttk.Label) -> None:
         progress_text: str
