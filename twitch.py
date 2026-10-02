@@ -1475,6 +1475,25 @@ class Twitch:
             logger.warning("Campaign catalog fallback returned an invalid payload")
             return {}
 
+        # Reject materially stale snapshots instead of presenting campaigns that
+        # may already have ended. The service advertises a 60-second refresh
+        # interval, but allow a generous grace period for transient delays.
+        last_updated_raw = payload.get("lastUpdatedAt")
+        refresh_interval = payload.get("refreshIntervalSeconds", 60)
+        try:
+            refresh_seconds = max(1, int(refresh_interval))
+            last_updated = timestamp(cast(str, last_updated_raw))
+        except (TypeError, ValueError):
+            logger.warning("Campaign catalog fallback returned invalid freshness metadata")
+            return {}
+        now = datetime.now(timezone.utc)
+        max_age = timedelta(seconds=max(300, refresh_seconds * 5))
+        if last_updated > now + timedelta(minutes=2) or now - last_updated > max_age:
+            logger.warning(
+                "Campaign catalog fallback is stale; refusing to use outdated campaign data"
+            )
+            return {}
+
         applicable_statuses = ("ACTIVE", "UPCOMING")
         campaigns: dict[str, JsonType] = {}
         for group in groups:
@@ -1492,6 +1511,16 @@ class Twitch:
                     not isinstance(campaign_id, str)
                     or raw_campaign.get("status") not in applicable_statuses
                 ):
+                    continue
+                try:
+                    campaign_start = timestamp(cast(str, raw_campaign["startAt"]))
+                    campaign_end = timestamp(cast(str, raw_campaign["endAt"]))
+                except (KeyError, TypeError, ValueError):
+                    continue
+                # Do not trust a cached ACTIVE/UPCOMING status after the real end
+                # timestamp. This prevents ended campaigns from resurfacing if the
+                # public catalog is briefly behind Twitch.
+                if campaign_end <= now:
                     continue
 
                 campaign: JsonType = deepcopy(raw_campaign)
