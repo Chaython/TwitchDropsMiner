@@ -785,7 +785,9 @@ class Twitch:
                 # ACL status checks and game-directory discovery are independent.
                 # Run both pipelines together, and batch GameDirectory operations
                 # instead of paying one HTTP round trip per eligible game.
-                acl_check_task = asyncio.create_task(self.bulk_check_online(acl_channels))
+                acl_check_task = asyncio.create_task(
+                    self.bulk_check_online(acl_channels, check_available_drops=False)
+                )
                 directory_task = asyncio.create_task(
                     self.get_live_streams_bulk(no_acl, drops_enabled=True)
                 )
@@ -810,6 +812,17 @@ class Twitch:
                 # offline (or online but low viewers) channels end up
                 to_remove_channels = ordered_channels[MAX_CHANNELS:]
                 ordered_channels = ordered_channels[:MAX_CHANNELS]
+
+                # The optional AvailableDrops verification is comparatively expensive.
+                # Only check retained online ACL channels instead of every ACL candidate
+                # discovered before MAX_CHANNELS trimming.
+                if self.settings.available_drops_check:
+                    await self.bulk_check_available_drops(
+                        channel
+                        for channel in ordered_channels
+                        if channel.acl_based and channel.online
+                    )
+
                 if to_remove_channels:
                     # tracked channels and gui were cleared earlier, so no need to do it here
                     # just make sure to unsubscribe from their topics
@@ -1811,10 +1824,17 @@ class Twitch:
             raise
         return channels
 
-    async def bulk_check_online(self, channels: abc.Iterable[Channel]):
+    async def bulk_check_online(
+        self,
+        channels: abc.Iterable[Channel],
+        *,
+        check_available_drops: bool | None = None,
+    ):
         """
         Utilize batch GQL requests to check ONLINE status for a lot of channels at once.
-        Also handles the drops_enabled check (if enabled).
+
+        AvailableDrops verification can be deferred until after channel ranking/trimming
+        so discarded ACL candidates do not consume extra GQL requests.
         """
         channel_list = list(channels)
         acl_streams_map: dict[int, JsonType] = {}
@@ -1839,9 +1859,12 @@ class Twitch:
             for task in stream_gql_tasks:
                 task.cancel()
             raise
+        if check_available_drops is None:
+            check_available_drops = self.settings.available_drops_check
+
         # for all channels with an active stream, check the available drops as well
         acl_available_drops_map: dict[int, list[JsonType]] = {}
-        if self.settings.available_drops_check:
+        if check_available_drops:
             available_gql_ops: list[GQLOperation] = [
                 GQL_QUERIES["AvailableDrops"].with_variables({"channelID": str(channel_id)})
                 for channel_id, channel_data in acl_streams_map.items()
@@ -1873,3 +1896,44 @@ class Twitch:
                 continue
             available_drops: list[JsonType] = acl_available_drops_map.get(channel_id, [])
             channel.external_update(channel_data, available_drops)
+
+    async def bulk_check_available_drops(
+        self, channels: abc.Iterable[Channel]
+    ) -> None:
+        """
+        Verify drop availability for already-ranked online channels in batches.
+
+        This is intentionally separate from bulk_check_online so the advanced
+        AvailableDrops check runs only for channels that survive MAX_CHANNELS trimming.
+        """
+        channel_list = [channel for channel in channels if channel.online]
+        if not channel_list:
+            return
+
+        operations: list[GQLOperation] = [
+            GQL_QUERIES["AvailableDrops"].with_variables(
+                {"channelID": str(channel.id)}
+            )
+            for channel in channel_list
+        ]
+        tasks: list[asyncio.Task[list[JsonType]]] = [
+            asyncio.create_task(self.gql_request(operation_chunk))
+            for operation_chunk in chunk(operations, 20)
+        ]
+        available_map: dict[int, list[JsonType]] = {}
+        try:
+            for coro in asyncio.as_completed(tasks):
+                response_list: list[JsonType] = await coro
+                for response_json in response_list:
+                    available_info: JsonType | None = response_json["data"]["channel"]
+                    if available_info is not None:
+                        available_map[int(available_info["id"])] = (
+                            available_info["viewerDropCampaigns"] or []
+                        )
+        except Exception:
+            for task in tasks:
+                task.cancel()
+            raise
+
+        for channel in channel_list:
+            channel.update_available_drops(available_map.get(channel.id, []))

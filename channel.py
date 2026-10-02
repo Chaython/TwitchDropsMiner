@@ -335,6 +335,10 @@ class Channel:
             for campaign_data in available_drops
         )
 
+    def update_available_drops(self, available_drops: list[JsonType]) -> None:
+        if self._stream is not None:
+            self._stream.drops_enabled = self._check_drops_enabled(available_drops)
+
     def external_update(self, channel_data: JsonType, available_drops: list[JsonType]):
         """
         Update stream information based on data provided externally.
