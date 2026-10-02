@@ -1367,52 +1367,87 @@ class Twitch:
             else:
                 response_list = [response_json]
             force_retry: bool = False
-            for response_json in response_list:
+            for response_index, response_json in enumerate(response_list):
+                if not isinstance(response_json, dict):
+                    raise GQLException(f"Unexpected GQL response: {response_json!r}")
+
+                # Twitch error responses do not consistently include
+                # extensions.operationName. Fall back to the submitted operation so
+                # logging an error never becomes a second, fatal KeyError.
+                extensions = response_json.get("extensions")
+                operation_name: str | None = (
+                    cast(str | None, extensions.get("operationName"))
+                    if isinstance(extensions, dict)
+                    else None
+                )
+                if operation_name is None:
+                    submitted_op: GQLOperation | None
+                    if isinstance(ops, list):
+                        submitted_op = ops[response_index] if response_index < len(ops) else None
+                    else:
+                        submitted_op = ops
+                    if isinstance(submitted_op, dict):
+                        operation_name = cast(str | None, submitted_op.get("operationName"))
+                operation_name = operation_name or "<unknown operation>"
+
                 # GQL error handling
                 if "errors" in response_json:
+                    handled_error = False
                     for error_dict in response_json["errors"]:
-                        if "message" in error_dict:
-                            if (
-                                single_retry
-                                and error_dict["message"] in (
-                                    "service error",
-                                    "PersistedQueryNotFound",
-                                )
-                            ):
-                                logger.error(
-                                    f"Retrying a {error_dict['message']} for "
-                                    f"{response_json['extensions']['operationName']}"
-                                )
-                                single_retry = False
-                                if delay < 5:
-                                    # overwrite the delay if too short
-                                    delay = 5
-                                force_retry = True
+                        if not isinstance(error_dict, dict):
+                            continue
+                        message = error_dict.get("message")
+                        if not isinstance(message, str):
+                            continue
+
+                        if message == "PersistedQueryNotFound" and single_retry:
+                            logger.error(f"Retrying {message} for {operation_name}")
+                            single_retry = False
+                            if delay < 5:
+                                delay = 5
+                            force_retry = True
+                            handled_error = True
+                            break
+
+                        if message == "server error":
+                            # Some server errors include a valid GraphQL path so the
+                            # failed field can be treated as null. If Twitch omits or
+                            # changes that path, retry instead of crashing on path[-1].
+                            data_obj = response_json.get("data")
+                            path = error_dict.get("path")
+                            if isinstance(data_obj, dict) and isinstance(path, list) and path:
+                                target: Any = data_obj
+                                try:
+                                    for key in path[:-1]:
+                                        target = target[key]
+                                    target[path[-1]] = None
+                                except (KeyError, IndexError, TypeError):
+                                    force_retry = True
+                                handled_error = True
                                 break
-                            elif error_dict["message"] == "server error":
-                                # nullify the key the error path points to
-                                data_dict: JsonType = response_json["data"]
-                                path: list[str] = error_dict.get("path", [])
-                                for key in path[:-1]:
-                                    data_dict = data_dict[key]
-                                data_dict[path[-1]] = None
-                                break
-                            elif (
-                                error_dict["message"] in (
-                                    "service timeout",
-                                    "request cancelled",
-                                    "service unavailable",
-                                    "context deadline exceeded",
-                                )
-                            ):
-                                force_retry = True
-                                break
-                    else:
-                        raise GQLException(response_json['errors'])
+                            force_retry = True
+                            handled_error = True
+                            break
+
+                        if message in (
+                            "service error",
+                            "service timeout",
+                            "request cancelled",
+                            "service unavailable",
+                            "context deadline exceeded",
+                        ):
+                            logger.warning(f"Retrying {message} for {operation_name}")
+                            force_retry = True
+                            handled_error = True
+                            break
+
+                    if not handled_error:
+                        raise GQLException(response_json["errors"])
                 # Other error handling
                 elif "error" in response_json:
                     raise GQLException(
-                        f"{response_json['error']}: {response_json['message']}"
+                        f"{response_json.get('error', 'GQL error')}: "
+                        f"{response_json.get('message', 'No message')}"
                     )
                 if force_retry:
                     break
