@@ -1722,31 +1722,23 @@ class Twitch:
                 switch_triggers.update(campaign.time_triggers)
             self.inventory.append(campaign)
             self._campaigns[campaign.id] = campaign
-        # concurrently add the campaigns into the GUI
-        # NOTE: this fetches pictures from the CDN, so might be slow without a cache
+        # Register campaigns in the virtualized GUI. add_campaign() is now
+        # model-only, so creating one asyncio task per campaign would just add
+        # scheduler overhead. Yield periodically to keep Tk responsive.
         status_update(
             _("gui", "status", "adding_campaigns").format(counter=f"(0/{len(campaigns)})")
         )
-        add_campaign_tasks: list[asyncio.Task[None]] = [
-            asyncio.create_task(self.gui.inv.add_campaign(campaign))
-            for campaign in campaigns
-        ]
-        try:
-            for i, coro in enumerate(asyncio.as_completed(add_campaign_tasks), start=1):
-                await coro
+        for i, campaign in enumerate(campaigns, start=1):
+            self.gui.inv.add_campaign(campaign)
+            if i == len(campaigns) or i % 25 == 0:
                 status_update(
                     _("gui", "status", "adding_campaigns").format(
                         counter=f"({i}/{len(campaigns)})"
                     )
                 )
-                # this is needed here explicitly, because cache reads from disk don't raise this
-                if self.gui.close_requested:
-                    raise ExitRequest()
-        except Exception:
-            # asyncio.as_completed doesn't cancel tasks on errors
-            for task in add_campaign_tasks:
-                task.cancel()
-            raise
+                await asyncio.sleep(0)
+            if self.gui.close_requested:
+                raise ExitRequest()
         self._mnt_triggers.extend(sorted(switch_triggers))
         # trim out all triggers that we're already past
         now = datetime.now(timezone.utc)

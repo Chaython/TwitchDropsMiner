@@ -1578,7 +1578,7 @@ class InventoryOverview:
             self._canvas.yview_scroll(delta, "units")
         self._schedule_virtualize()
 
-    async def add_campaign(self, campaign: DropsCampaign) -> None:
+    def add_campaign(self, campaign: DropsCampaign) -> None:
         # Inventory population only records the model. Heavy Tk widgets and image
         # decoding are deferred until the campaign is near the visible viewport.
         if campaign in self._campaigns:
@@ -3239,7 +3239,7 @@ if __name__ == "__main__":
             "Wardrobe Cleaning", "Cleaning Masters", ["Fancy Pants"], 2, 7, 0, 240
         )
         campaign = drop.campaign
-        await gui.inv.add_campaign(campaign)
+        gui.inv.add_campaign(campaign)
 
         gui.print("Single-line test message")
         await asyncio.sleep(1)
