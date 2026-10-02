@@ -904,6 +904,8 @@ class ChannelList:
         )
         self._add_column("acl_base", "📋", width_template="✔")
         self._channel_map: dict[str, Channel] = {}
+        self._display_batch_depth = 0
+        self._pending_widths: dict[str, int] = {}
 
     def _add_column(
         self,
@@ -962,7 +964,8 @@ class ChannelList:
 
     def _redraw(self):
         # this forces a redraw that recalculates widget width
-        self._table.event_generate("<<ThemeChanged>>")
+        if self._display_batch_depth == 0:
+            self._table.event_generate("<<ThemeChanged>>")
 
     def _adjust_width(self, column: str, value: str):
         # causes the column to expand if the value's width is greater than the current width
@@ -970,6 +973,13 @@ class ChannelList:
             return
         value_width = self._measure(value)
         curr_width = self._table.column(column, "width")
+        if self._display_batch_depth:
+            if value_width > curr_width:
+                self._pending_widths[column] = max(
+                    value_width,
+                    self._pending_widths.get(column, curr_width),
+                )
+            return
         if value_width > curr_width:
             self._table.column(column, width=value_width)
             self._redraw()
@@ -1071,6 +1081,30 @@ class ChannelList:
                     "channel": channel.name,
                 },
             )
+
+    def display_many(self, channels: abc.Iterable[Channel]) -> None:
+        """
+        Add/update a group of channels while deferring column resize redraws.
+
+        During initial channel gathering, repeated <<ThemeChanged>> events are
+        substantially more expensive than the inserts themselves.
+        """
+        self._display_batch_depth += 1
+        try:
+            for channel in channels:
+                self.display(channel, add=True)
+        finally:
+            self._display_batch_depth -= 1
+            if self._display_batch_depth == 0 and self._pending_widths:
+                changed = False
+                for column, width in self._pending_widths.items():
+                    curr_width = self._table.column(column, "width")
+                    if width > curr_width:
+                        self._table.column(column, width=width)
+                        changed = True
+                self._pending_widths.clear()
+                if changed:
+                    self._redraw()
 
     def remove(self, channel: Channel):
         iid = channel.iid

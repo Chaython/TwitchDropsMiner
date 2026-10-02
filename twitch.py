@@ -781,14 +781,22 @@ class Twitch:
                             no_acl.add(campaign.game)
                 # remove all ACL channels that already exist from the other set
                 acl_channels.difference_update(new_channels)
-                # use the other set to set them online if possible
-                await self.bulk_check_online(acl_channels)
+
+                # ACL status checks and game-directory discovery are independent.
+                # Run both pipelines together, and batch GameDirectory operations
+                # instead of paying one HTTP round trip per eligible game.
+                acl_check_task = asyncio.create_task(self.bulk_check_online(acl_channels))
+                directory_task = asyncio.create_task(
+                    self.get_live_streams_bulk(no_acl, drops_enabled=True)
+                )
+                _, directory_channels = await asyncio.gather(
+                    acl_check_task,
+                    directory_task,
+                )
+
                 # finally, add them as new channels
                 new_channels.update(acl_channels)
-                for game in no_acl:
-                    # for every campaign without an ACL, for it's game,
-                    # add a list of live channels with drops enabled
-                    new_channels.update(await self.get_live_streams(game, drops_enabled=True))
+                new_channels.update(directory_channels)
                 # sort them descending by viewers, by priority and by game priority
                 # NOTE: Viewers sort also ensures ONLINE channels are sorted to the top
                 # NOTE: We can drop using the set now, because there's no more channels being added
@@ -818,7 +826,7 @@ class Twitch:
                 # set our new channel list
                 for channel in ordered_channels:
                     channels[channel.id] = channel
-                    channel.display(add=True)
+                self.gui.channels.display_many(ordered_channels)
                 # subscribe to these channel's state updates
                 to_add_topics: list[WebsocketTopic] = []
                 for channel_id in channels:
@@ -1703,42 +1711,114 @@ class Twitch:
             return campaigns[0]
         return None
 
-    async def get_live_streams(
+    def _game_directory_op(
         self, game: Game, *, limit: int = 20, drops_enabled: bool = True
-    ) -> list[Channel]:
+    ) -> GQLOperation:
         filters: list[str] = []
         if drops_enabled:
             filters.append("DROPS_ENABLED")
+        return GQL_QUERIES["GameDirectory"].with_variables({
+            "limit": limit,
+            "slug": game.slug,
+            "options": {
+                "includeRestricted": ["SUB_ONLY_LIVE"],
+                "systemFilters": filters,
+            },
+        })
+
+    def _channels_from_game_directory(
+        self, response: JsonType, *, drops_enabled: bool
+    ) -> list[Channel]:
+        game_data = response.get("data", {}).get("game")
+        if not game_data:
+            return []
+        return [
+            Channel.from_directory(
+                self, stream_channel_data["node"], drops_enabled=drops_enabled
+            )
+            for stream_channel_data in game_data["streams"]["edges"]
+            if stream_channel_data["node"]["broadcaster"] is not None
+        ]
+
+    async def get_live_streams(
+        self, game: Game, *, limit: int = 20, drops_enabled: bool = True
+    ) -> list[Channel]:
         try:
             response = await self.gql_request(
-                GQL_QUERIES["GameDirectory"].with_variables({
-                    "limit": limit,
-                    "slug": game.slug,
-                    "options": {
-                        "includeRestricted": ["SUB_ONLY_LIVE"],
-                        "systemFilters": filters,
-                    },
-                })
+                self._game_directory_op(
+                    game,
+                    limit=limit,
+                    drops_enabled=drops_enabled,
+                )
             )
         except GQLException as exc:
             raise MinerException(f"Game: {game.slug}") from exc
-        if "game" in response["data"]:
-            return [
-                Channel.from_directory(
-                    self, stream_channel_data["node"], drops_enabled=drops_enabled
-                )
-                for stream_channel_data in response["data"]["game"]["streams"]["edges"]
-                if stream_channel_data["node"]["broadcaster"] is not None
-            ]
-        return []
+        return self._channels_from_game_directory(
+            response,
+            drops_enabled=drops_enabled,
+        )
+
+    async def get_live_streams_bulk(
+        self,
+        games: abc.Iterable[Game],
+        *,
+        limit: int = 20,
+        drops_enabled: bool = True,
+    ) -> list[Channel]:
+        """
+        Fetch live channels for multiple games using batched GQL operations.
+
+        Twitch accepts lists of persisted GQL operations. Grouping up to 20
+        GameDirectory queries per request removes the old one-request-per-game
+        latency while preserving fresh discovery on every channel refresh.
+        """
+        game_list = list(games)
+        if not game_list:
+            return []
+
+        operations: list[GQLOperation] = [
+            self._game_directory_op(
+                game,
+                limit=limit,
+                drops_enabled=drops_enabled,
+            )
+            for game in game_list
+        ]
+        tasks: list[asyncio.Task[list[JsonType]]] = [
+            asyncio.create_task(self.gql_request(operation_chunk))
+            for operation_chunk in chunk(operations, 20)
+        ]
+
+        channels: list[Channel] = []
+        try:
+            for coro in asyncio.as_completed(tasks):
+                response_list: list[JsonType] = await coro
+                for response in response_list:
+                    channels.extend(
+                        self._channels_from_game_directory(
+                            response,
+                            drops_enabled=drops_enabled,
+                        )
+                    )
+        except GQLException as exc:
+            for task in tasks:
+                task.cancel()
+            game_names = ", ".join(game.slug for game in game_list)
+            raise MinerException(f"Games: {game_names}") from exc
+        except Exception:
+            for task in tasks:
+                task.cancel()
+            raise
+        return channels
 
     async def bulk_check_online(self, channels: abc.Iterable[Channel]):
         """
         Utilize batch GQL requests to check ONLINE status for a lot of channels at once.
         Also handles the drops_enabled check (if enabled).
         """
+        channel_list = list(channels)
         acl_streams_map: dict[int, JsonType] = {}
-        stream_gql_ops: list[GQLOperation] = [channel.stream_gql for channel in channels]
+        stream_gql_ops: list[GQLOperation] = [channel.stream_gql for channel in channel_list]
         if not stream_gql_ops:
             # shortcut for nothing to process
             # NOTE: Have to do this here, becase "channels" can be any iterable
@@ -1784,7 +1864,7 @@ class Twitch:
                 for task in available_gql_tasks:
                     task.cancel()
                 raise
-        for channel in channels:
+        for channel in channel_list:
             channel_id = channel.id
             if channel_id not in acl_streams_map:
                 continue
