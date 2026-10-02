@@ -11,6 +11,13 @@ env:
   PYTHON_VERSION: "3.10"
   USE_UPX: false
 
+# Only the newest build for a branch is useful, especially for master where every
+# successful run replaces the shared dev-build prerelease. Cancel superseded runs
+# to avoid wasting runners and racing the release delete/recreate sequence.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   validate:
     name: Validate
