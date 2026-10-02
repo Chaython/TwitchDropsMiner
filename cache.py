@@ -5,6 +5,7 @@ from datetime import datetime, timedelta, timezone
 
 import io
 import json
+from collections import OrderedDict
 from typing import Dict, TypedDict, NewType, TYPE_CHECKING
 
 from utils import json_load, json_save
@@ -35,6 +36,8 @@ default_database: Hashes = {}
 
 class ImageCache:
     LIFETIME = timedelta(days=7)
+    MAX_MEMORY_IMAGES = 128
+    MAX_MEMORY_PHOTOS = 256
 
     def __init__(self, manager: GUIManager) -> None:
         self._root = manager._root
@@ -48,8 +51,8 @@ class ImageCache:
             # then reinitialize the image cache anew
             cleanup = True
             self._hashes = default_database.copy()
-        self._images: dict[ImageHash, Image] = {}
-        self._photos: dict[tuple[ImageHash, ImageSize], PhotoImage] = {}
+        self._images: OrderedDict[ImageHash, Image] = OrderedDict()
+        self._photos: OrderedDict[tuple[ImageHash, ImageSize], PhotoImage] = OrderedDict()
         # Serialize duplicate requests for the same URL, but allow unrelated
         # campaign/reward images to download concurrently. The old single global
         # lock made every visible image wait for all previous images.
@@ -104,11 +107,15 @@ class ImageCache:
                 self._hashes[url]["expires"] = self._new_expires()
                 if img_hash in self._images:
                     image = self._images[img_hash]
+                    self._images.move_to_end(img_hash)
                 else:
                     try:
                         loaded = Image_module.open(CACHE_PATH / img_hash)
                         loaded.load()  # force full decode so broken data is caught here
                         self._images[img_hash] = image = loaded
+                        self._images.move_to_end(img_hash)
+                        while len(self._images) > self.MAX_MEMORY_IMAGES:
+                            self._images.popitem(last=False)
                     except (FileNotFoundError, Image_module.UnidentifiedImageError, OSError):
                         pass
             if image is None:
@@ -123,6 +130,9 @@ class ImageCache:
                     image = Image_module.new("RGB", (10, 10), (255, 255, 255))
                 img_hash = self._hash(image)
                 self._images[img_hash] = image
+                self._images.move_to_end(img_hash)
+                while len(self._images) > self.MAX_MEMORY_IMAGES:
+                    self._images.popitem(last=False)
                 image.save(CACHE_PATH / img_hash)
                 self._hashes[url] = {
                     "hash": img_hash,
@@ -135,6 +145,7 @@ class ImageCache:
             size = image.size
         photo_key = (img_hash, size)
         if photo_key in self._photos:
+            self._photos.move_to_end(photo_key)
             return self._photos[photo_key]
         if image.size != size:
             try:
@@ -143,4 +154,7 @@ class ImageCache:
                 # broken image data surfaced during resize; fall back to blank placeholder
                 image = Image_module.new("RGB", size, (255, 255, 255))
         self._photos[photo_key] = photo = PhotoImage(master=self._root, image=image)
+        self._photos.move_to_end(photo_key)
+        while len(self._photos) > self.MAX_MEMORY_PHOTOS:
+            self._photos.popitem(last=False)
         return photo

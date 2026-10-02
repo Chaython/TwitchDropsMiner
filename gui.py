@@ -1731,6 +1731,9 @@ class InventoryOverview:
             if display["frame"] is not campaign_frame:
                 return
             campaign_image_label.config(image=campaign_image)
+            # Tk widgets only store the Tcl image name. Keep a Python reference on
+            # the visible label so ImageCache can evict old off-screen PhotoImages.
+            setattr(campaign_image_label, "_image_ref", campaign_image)
 
             if benefit_labels:
                 benefit_images: list[PhotoImage] = await asyncio.gather(
@@ -1743,6 +1746,7 @@ class InventoryOverview:
                     return
                 for (benefit_label, benefit), image in zip(benefit_labels, benefit_images):
                     benefit_label.config(image=image)
+                    setattr(benefit_label, "_image_ref", image)
 
             self._canvas.after_idle(
                 lambda frame=campaign_frame, gen=generation: self._measure_campaign_width(
