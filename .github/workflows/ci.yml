@@ -328,11 +328,15 @@ jobs:
         with:
           path: artifacts
 
-      # The Windows Actions artifact is intentionally uploaded uncompressed to avoid
-      # ZIP-inside-ZIP downloads. Recreate the named ZIP here only for the Releases page.
+      # The Windows Actions artifact is intentionally uploaded as a folder so its
+      # downloadable artifact ZIP contains the executable/manual directly (single wrap).
+      # download-artifact extracts those files at the artifact root, so recreate the
+      # friendly "Twitch Drops Miner" folder only for the Releases-page ZIP.
       - name: Package Windows release asset
         run: |
-          cd artifacts/Twitch.Drops.Miner.Windows
+          mkdir -p "release-windows/Twitch Drops Miner"
+          cp -a artifacts/Twitch.Drops.Miner.Windows/. "release-windows/Twitch Drops Miner/"
+          cd release-windows
           zip -r "$GITHUB_WORKSPACE/Twitch.Drops.Miner.Windows.zip" "Twitch Drops Miner"
 
       - name: Delete the existing pre-release (if present)
