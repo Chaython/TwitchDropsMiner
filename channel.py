@@ -235,7 +235,10 @@ class Channel:
 
     @property
     def url(self) -> URLType:
-        return URLType(f"{self._twitch._client_type.CLIENT_URL}/{self._login}")
+        # Channel HTML is always fetched from the normal Twitch website. SMARTBOX
+        # authentication is only an API identity; android.tv.twitch.tv channel pages
+        # do not expose the settings/spade metadata needed for watch tracking.
+        return URLType(f"https://www.twitch.tv/{self._login}")
 
     @property
     def iid(self) -> str:

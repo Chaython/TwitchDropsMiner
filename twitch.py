@@ -1439,6 +1439,94 @@ class Twitch:
         }
         return self._merge_data(campaign_ids, fetched_data)
 
+    async def fetch_campaign_catalog(self) -> dict[str, JsonType]:
+        """
+        Fetch full campaign metadata from the public Twitch Drops catalog.
+
+        Twitch's SMARTBOX client can still use the device OAuth flow, but Twitch
+        intentionally returns an empty/incomplete ViewerDropsDashboard response for it.
+        The catalog is used only for public campaign metadata; authentication, inventory
+        progress, websocket updates, watch events and claiming remain direct Twitch calls.
+        """
+        catalog_url = "https://twitch-drops-api.sunkwi.com/v2/drops"
+        request_kwargs: JsonType = {"headers": {"Accept": "application/json"}}
+        if self.settings.proxy:
+            request_kwargs["proxy"] = self.settings.proxy
+
+        try:
+            timeout = aiohttp.ClientTimeout(total=20)
+            async with aiohttp.ClientSession(
+                timeout=timeout,
+                cookie_jar=aiohttp.DummyCookieJar(),
+                headers={"User-Agent": "TwitchDropsMiner campaign fallback"},
+            ) as session:
+                async with session.get(catalog_url, **request_kwargs) as response:
+                    if response.status != 200:
+                        raise RequestException(
+                            f"Campaign catalog returned HTTP {response.status}"
+                        )
+                    payload: JsonType = await response.json()
+        except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, RequestException) as exc:
+            logger.warning(f"Campaign catalog fallback failed: {exc}")
+            return {}
+
+        groups = payload.get("data")
+        if not isinstance(groups, list):
+            logger.warning("Campaign catalog fallback returned an invalid payload")
+            return {}
+
+        applicable_statuses = ("ACTIVE", "UPCOMING")
+        campaigns: dict[str, JsonType] = {}
+        for group in groups:
+            if not isinstance(group, dict):
+                continue
+            box_art_url = group.get("gameBoxArtURL", "")
+            rewards = group.get("rewards") or []
+            if not isinstance(rewards, list):
+                continue
+            for raw_campaign in rewards:
+                if not isinstance(raw_campaign, dict):
+                    continue
+                campaign_id = raw_campaign.get("id")
+                if (
+                    not isinstance(campaign_id, str)
+                    or raw_campaign.get("status") not in applicable_statuses
+                ):
+                    continue
+
+                campaign: JsonType = deepcopy(raw_campaign)
+                game = campaign.get("game")
+                if not isinstance(game, dict):
+                    continue
+                game.setdefault("boxArtURL", box_art_url)
+
+                # The public catalog cannot know account-specific linkage state.
+                # Inventory data, when present, wins during the merge below. For
+                # catalog-only campaigns assume eligibility so they remain mineable;
+                # Twitch will still enforce actual account linkage server-side.
+                if not isinstance(campaign.get("self"), dict):
+                    campaign["self"] = {"isAccountConnected": True}
+                else:
+                    campaign["self"].setdefault("isAccountConnected", True)
+
+                allowed = campaign.get("allow")
+                if not isinstance(allowed, dict):
+                    allowed = {"isEnabled": False, "channels": None}
+                    campaign["allow"] = allowed
+                else:
+                    allowed.setdefault("channels", None)
+
+                if not isinstance(campaign.get("timeBasedDrops"), list):
+                    campaign["timeBasedDrops"] = []
+                campaign.setdefault("accountLinkURL", "")
+                campaigns[campaign_id] = campaign
+
+        logger.warning(
+            "Twitch did not expose the full campaign list to the SMARTBOX client; "
+            f"using public campaign metadata fallback ({len(campaigns)} campaigns)."
+        )
+        return campaigns
+
     async def fetch_inventory(self) -> None:
         status_update = self.gui.status.update
         status_update(_("gui", "status", "fetching_inventory"))
@@ -1460,22 +1548,30 @@ class Twitch:
             for c in available_list
             if c["status"] in applicable_statuses  # that are currently not expired
         }
-        # fetch detailed data for each campaign, in chunks
+
         status_update(_("gui", "status", "fetching_campaigns"))
-        fetch_campaigns_tasks: list[asyncio.Task[Any]] = [
-            asyncio.create_task(self.fetch_campaigns(campaigns_chunk))
-            for campaigns_chunk in chunk(available_campaigns.items(), 20)
-        ]
-        try:
-            for coro in asyncio.as_completed(fetch_campaigns_tasks):
-                chunk_campaigns_data = await coro
-                # merge the inventory and campaigns datas together
-                inventory_data = self._merge_data(inventory_data, chunk_campaigns_data)
-        except Exception:
-            # asyncio.as_completed doesn't cancel tasks on errors
-            for task in fetch_campaigns_tasks:
-                task.cancel()
-            raise
+        if self._client_type is ClientType.SMARTBOX:
+            # SMARTBOX can authenticate, but Twitch does not expose the complete
+            # campaign dashboard to this client. Use public metadata as the
+            # discovery layer and keep account-specific inventory data authoritative.
+            catalog_campaigns = await self.fetch_campaign_catalog()
+            inventory_data = self._merge_data(inventory_data, catalog_campaigns)
+        else:
+            # Normal clients can still resolve campaign details directly from Twitch.
+            fetch_campaigns_tasks: list[asyncio.Task[Any]] = [
+                asyncio.create_task(self.fetch_campaigns(campaigns_chunk))
+                for campaigns_chunk in chunk(available_campaigns.items(), 20)
+            ]
+            try:
+                for coro in asyncio.as_completed(fetch_campaigns_tasks):
+                    chunk_campaigns_data = await coro
+                    # merge the inventory and campaigns datas together
+                    inventory_data = self._merge_data(inventory_data, chunk_campaigns_data)
+            except Exception:
+                # asyncio.as_completed doesn't cancel tasks on errors
+                for task in fetch_campaigns_tasks:
+                    task.cancel()
+                raise
         # filter out invalid campaigns
         for campaign_id in list(inventory_data.keys()):
             if inventory_data[campaign_id]["game"] is None:
