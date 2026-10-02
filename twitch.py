@@ -152,11 +152,34 @@ class _AuthState:
                     #     "verification_uri": "https://www.twitch.tv/activate?device-code=ABCDEFGH"
                     # }
                     response_json: JsonType = await response.json()
-                    device_code: str = response_json["device_code"]
-                    user_code: str = response_json["user_code"]
-                    interval: int = response_json["interval"]
-                    verification_uri: URL = URL(response_json["verification_uri"])
-                    expires_at = now + timedelta(seconds=response_json["expires_in"])
+                    required_fields = (
+                        "device_code",
+                        "user_code",
+                        "interval",
+                        "verification_uri",
+                        "expires_in",
+                    )
+                    missing_fields = [
+                        field for field in required_fields if field not in response_json
+                    ]
+                    if response.status != 200 or missing_fields:
+                        # Twitch returns an error JSON (for example {"error": "invalid client"})
+                        # when a client is no longer eligible for device authorization. Do not
+                        # turn that into an opaque KeyError: surface a useful login error instead.
+                        error_detail = cast(
+                            str,
+                            response_json.get("message")
+                            or response_json.get("error")
+                            or f"HTTP {response.status}",
+                        )
+                        raise LoginException(
+                            f"Twitch device authorization failed: {error_detail}"
+                        )
+                    device_code: str = cast(str, response_json["device_code"])
+                    user_code: str = cast(str, response_json["user_code"])
+                    interval: int = int(response_json["interval"])
+                    verification_uri: URL = URL(cast(str, response_json["verification_uri"]))
+                    expires_at = now + timedelta(seconds=int(response_json["expires_in"]))
 
                 # Print the code to the user, open them the activate page so they can type it in
                 await login_form.ask_enter_code(verification_uri, user_code)
@@ -445,7 +468,11 @@ class Twitch:
         # Do not modify the default, safe values.
         self._qgl_limiter = RateLimiter(capacity=5, window=1)
         # Client type, session and auth
-        self._client_type: ClientInfo = ClientType.ANDROID_APP
+        # Twitch stopped issuing device codes to the Android app client in September 2026.
+        # Use the Smart Box client for the device authorization flow; this mirrors the
+        # upstream v1.3.1 login fix and prevents fresh installs from failing before the
+        # browser activation page can be opened.
+        self._client_type: ClientInfo = ClientType.SMARTBOX
         self._session: aiohttp.ClientSession | None = None
         self._auth_state: _AuthState = _AuthState(self)
         # GUI
