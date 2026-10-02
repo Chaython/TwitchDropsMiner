@@ -91,20 +91,21 @@ jobs:
         run: |
           pyinstaller build.spec
 
-      - name: Create release folder
+      - name: Create artifact folder
         run: |
           $FolderName = 'Twitch Drops Miner'
           New-Item $FolderName -ItemType Directory
           Copy-Item dist\*.exe $FolderName
           Copy-Item manual.txt $FolderName
-          Compress-Archive -Path $FolderName -DestinationPath Twitch.Drops.Miner.Windows.zip
 
+      # upload-artifact already produces a ZIP download. Upload the folder directly
+      # so the Actions artifact contains the executable/manual instead of ZIP-inside-ZIP.
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
           if-no-files-found: error
           name: Twitch.Drops.Miner.Windows
-          path: Twitch.Drops.Miner.Windows.zip
+          path: Twitch Drops Miner
 
   macos:
     name: macOS
@@ -327,6 +328,13 @@ jobs:
         with:
           path: artifacts
 
+      # The Windows Actions artifact is intentionally uploaded uncompressed to avoid
+      # ZIP-inside-ZIP downloads. Recreate the named ZIP here only for the Releases page.
+      - name: Package Windows release asset
+        run: |
+          cd artifacts/Twitch.Drops.Miner.Windows
+          zip -r "$GITHUB_WORKSPACE/Twitch.Drops.Miner.Windows.zip" "Twitch Drops Miner"
+
       - name: Delete the existing pre-release (if present)
         run: |
           TAG=dev-build
@@ -343,7 +351,7 @@ jobs:
         with:
           allowUpdates: true
           artifactErrorsFailBuild: true
-          artifacts: artifacts/*/*
+          artifacts: Twitch.Drops.Miner.Windows.zip,artifacts/*/*.zip
           body: |
             **This is an automatically generated in-development pre-release version of the application, that includes the latest master branch changes.**
             **⚠️ This build is not stable and may end up terminating with a fatal error. ⚠️**
