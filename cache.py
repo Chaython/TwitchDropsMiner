@@ -50,7 +50,10 @@ class ImageCache:
             self._hashes = default_database.copy()
         self._images: dict[ImageHash, Image] = {}
         self._photos: dict[tuple[ImageHash, ImageSize], PhotoImage] = {}
-        self._lock = asyncio.Lock()
+        # Serialize duplicate requests for the same URL, but allow unrelated
+        # campaign/reward images to download concurrently. The old single global
+        # lock made every visible image wait for all previous images.
+        self._url_locks: dict[URLType, asyncio.Lock] = {}
         self._altered: bool = False
         # cleanup the URLs
         hash_counts: dict[ImageHash, int] = {}
@@ -93,7 +96,8 @@ class ImageCache:
         return ImageHash(f"{int(bits, 2):x}.png")
 
     async def get(self, url: URLType, size: ImageSize | None = None) -> PhotoImage:
-        async with self._lock:
+        url_lock = self._url_locks.setdefault(url, asyncio.Lock())
+        async with url_lock:
             image: Image | None = None
             if url in self._hashes:
                 img_hash = self._hashes[url]["hash"]
