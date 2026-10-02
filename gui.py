@@ -1741,7 +1741,7 @@ class InventoryOverview:
                 )
                 if display["frame"] is not campaign_frame:
                     return
-                for (benefit_label, _), image in zip(benefit_labels, benefit_images):
+                for (benefit_label, benefit), image in zip(benefit_labels, benefit_images):
                     benefit_label.config(image=image)
 
             self._canvas.after_idle(
