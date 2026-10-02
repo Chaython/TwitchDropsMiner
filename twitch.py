@@ -791,10 +791,24 @@ class Twitch:
                 directory_task = asyncio.create_task(
                     self.get_live_streams_bulk(no_acl, drops_enabled=True)
                 )
-                _acl_result, directory_channels = await asyncio.gather(
-                    acl_check_task,
-                    directory_task,
-                )
+                try:
+                    _acl_result, directory_channels = await asyncio.gather(
+                        acl_check_task,
+                        directory_task,
+                    )
+                except (Exception, asyncio.CancelledError):
+                    # gather() does not reliably cancel sibling tasks when one
+                    # independently-created task fails. Stop and drain both so a
+                    # failed channel refresh cannot keep mutating state in background.
+                    for task in (acl_check_task, directory_task):
+                        if not task.done():
+                            task.cancel()
+                    await asyncio.gather(
+                        acl_check_task,
+                        directory_task,
+                        return_exceptions=True,
+                    )
+                    raise
 
                 # finally, add them as new channels
                 new_channels.update(acl_channels)
