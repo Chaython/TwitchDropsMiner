@@ -1512,6 +1512,9 @@ class InventoryOverview:
         if self._render_tasks.get(campaign) is task:
             self._render_tasks.pop(campaign, None)
         if task.cancelled():
+            # A row may have become visible again while its previous render task
+            # was still being cancelled. Re-evaluate the viewport immediately.
+            self._schedule_virtualize()
             return
         exc = task.exception()
         if exc is not None:
@@ -1519,6 +1522,7 @@ class InventoryOverview:
                 f"Inventory campaign render failed: {campaign.id}",
                 exc_info=(type(exc), exc, exc.__traceback__),
             )
+        self._schedule_virtualize()
 
     def _on_mousewheel(self, event: tk.Event[tk.Misc]):
         self._wheel_delta += -1 if event.delta > 0 else 1
@@ -1727,7 +1731,10 @@ class InventoryOverview:
 
     def _unrealize_campaign(self, campaign: DropsCampaign) -> None:
         task = self._render_tasks.get(campaign)
-        current = asyncio.current_task()
+        try:
+            current = asyncio.current_task()
+        except RuntimeError:
+            current = None
         if task is not None and task is not current and not task.done():
             task.cancel()
 
