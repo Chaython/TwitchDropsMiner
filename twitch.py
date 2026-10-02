@@ -760,10 +760,11 @@ class Twitch:
                     self.change_state(State.IDLE)
             elif self._state is State.CHANNELS_FETCH:
                 self.gui.status.update(_("gui", "status", "gathering"))
-                # start with all current channels, clear the memory and GUI
+                # Start with all current channels, but keep the live mapping intact
+                # while network discovery runs. PubSub remains subscribed during this
+                # phase, so clearing the mapping here creates a race where valid stream
+                # events resolve as "non-existing channel".
                 new_channels: set[Channel] = set(channels.values())
-                channels.clear()
-                self.gui.channels.clear()
                 # gather and add ACL channels from campaigns
                 # NOTE: we consider only campaigns that can be progressed
                 # NOTE: we use another set so that we can set them online separately
@@ -824,7 +825,6 @@ class Twitch:
                 # ensure that we won't end up with more channels than we can handle
                 # NOTE: we trim from the end because that's where the non-priority,
                 # offline (or online but low viewers) channels end up
-                to_remove_channels = ordered_channels[MAX_CHANNELS:]
                 ordered_channels = ordered_channels[:MAX_CHANNELS]
 
                 # The optional AvailableDrops verification is comparatively expensive.
@@ -837,10 +837,17 @@ class Twitch:
                         if channel.acl_based and channel.online
                     )
 
+                # Atomically reconcile the discovered set with the currently tracked
+                # set. All network awaits are finished above, so there is no event-loop
+                # interleaving between removing stale channels and repopulating the GUI.
+                desired_ids = {channel.id for channel in ordered_channels}
+                to_remove_channels = [
+                    channel
+                    for channel_id, channel in channels.items()
+                    if channel_id not in desired_ids
+                ]
                 if to_remove_channels:
-                    # tracked channels and gui were cleared earlier, so no need to do it here
-                    # just make sure to unsubscribe from their topics
-                    to_remove_topics = []
+                    to_remove_topics: list[str] = []
                     for channel in to_remove_channels:
                         to_remove_topics.append(
                             WebsocketTopic.as_str("Channel", "StreamState", channel.id)
@@ -849,11 +856,19 @@ class Twitch:
                             WebsocketTopic.as_str("Channel", "StreamUpdate", channel.id)
                         )
                     self.websocket.remove_topics(to_remove_topics)
-                    del to_remove_channels, to_remove_topics
-                # set our new channel list
+                    for channel in to_remove_channels:
+                        del channels[channel.id]
+                        channel.remove()
+                    del to_remove_topics
+
+                # Rebuild only the visual ordering now that the authoritative channel
+                # mapping is stable. Existing Channel objects remain valid throughout
+                # the fetch, so queued PubSub events can still resolve correctly.
+                self.gui.channels.clear()
                 for channel in ordered_channels:
                     channels[channel.id] = channel
                 self.gui.channels.display_many(ordered_channels)
+                del desired_ids, to_remove_channels
                 # subscribe to these channel's state updates
                 to_add_topics: list[WebsocketTopic] = []
                 for channel_id in channels:
@@ -1115,7 +1130,9 @@ class Twitch:
         msg_type = message["type"]
         channel = self.channels.get(channel_id)
         if channel is None:
-            logger.error(f"Stream state change for a non-existing channel: {channel_id}")
+            # PubSub messages already queued before an UNLISTEN can arrive after
+            # channel cleanup. They are stale by definition and safe to ignore.
+            logger.debug(f"Ignoring stale stream state for removed channel: {channel_id}")
             return
         if msg_type == "viewcount":
             if not channel.online:
@@ -1151,7 +1168,9 @@ class Twitch:
         # }
         channel = self.channels.get(channel_id)
         if channel is None:
-            logger.error(f"Broadcast settings update for a non-existing channel: {channel_id}")
+            # Same cleanup race as stream-state messages: an in-flight update can
+            # arrive after its channel/topic has already been removed.
+            logger.debug(f"Ignoring stale broadcast update for removed channel: {channel_id}")
             return
         if message["old_game"] != message["game"]:
             game_change = f", game changed: {message['old_game']} -> {message['game']}"
