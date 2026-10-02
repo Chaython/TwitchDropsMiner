@@ -791,7 +791,7 @@ class Twitch:
                 directory_task = asyncio.create_task(
                     self.get_live_streams_bulk(no_acl, drops_enabled=True)
                 )
-                _, directory_channels = await asyncio.gather(
+                _acl_result, directory_channels = await asyncio.gather(
                     acl_check_task,
                     directory_task,
                 )
